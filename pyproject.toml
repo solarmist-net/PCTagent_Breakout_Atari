@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "pctagent-breakout-atari"
+version = "0.1.0"
+description = ""
+authors = ["Tauseef Gulrez <gtauseef@ieee.org>"]
+readme = "README.md"
+packages = [{include = "pctagent_breakout_atari"}]
+
+[tool.poetry.dependencies]
+gym = {extras = ["atari"], version = "^0.26.2"}
+numpy = "^1.23.4"
+opencv-python = "^4.6.0.66"
+python = "^3.8"
+matplotlib = "^3.6.1"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^22.10.0"
+flake8 = "^5.0.4"
+ipdb = "^0.13.9"
+ipython = "^8.5.0"
+isort = "^5.10.1"
+pre-commit = "^2.20.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+include_trailing_comma = true
