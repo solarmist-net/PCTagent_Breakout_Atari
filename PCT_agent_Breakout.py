@@ -1,73 +1,219 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 """
 Created on Fri Jun 25 01:12:23 2021
-
 @author: Tauseef Gulrez and Warren Mansell
 Melbourne, Australia and Manchester, UK
 
-"""
-
-# -*- coding: utf-8 -*-
-"""
 Created on Sat Jun  5 23:11:13 2021
-
 @author: gtaus
+
 """
+from typing import Optional, Tuple, cast
 
-#!/usr/bin/env python
-import sys
-
-sys.path.append("D:/Anaconda/envs/spyder/Lib/site-packages")
-import gym, time, cv2
-import numpy as np
 import collections
+import sys
+import time
 
-env = gym.make("BreakoutNoFrameskip-v4" if len(sys.argv) < 2 else sys.argv[1])
+import cv2
+import gym
+import numpy as np
 
-if not hasattr(env.action_space, "n"):
-    raise Exception("Keyboard agent only supports discrete action spaces")
-ACTIONS = env.action_space.n
+from gym.spaces import Discrete
+
+from consts import (
+    ACTIONS,
+    ASCII_DASH,
+    ASCII_SPACE,
+    BLUE,
+    CENTER_OFFSET,
+    CROP_HEIGHT,
+    CROP_WIDTH,
+    FILL,
+    GREEN,
+    IMG_HEIGHT,
+    IMG_WIDTH,
+    RENDER_MODE,
+    UTF_DASH_FULL,
+    X_CROP,
+    Y_CROP,
+)
+
+args = "BreakoutNoFrameskip-v4" if len(sys.argv) < 2 else sys.argv[1]
+env = gym.make(args, render_mode=RENDER_MODE, full_action_space=True)
+
+# Determine the valid actions
+NUM_ACTIONS = cast(Discrete, env.action_space).n
+RESTART_KEYS = (UTF_DASH_FULL, ASCII_DASH)
+PAUSE_KEYS = (ASCII_SPACE,)
+
+# Human interactions
 SKIP_CONTROL = 0
-human_agent_action = 0
 human_wants_restart = False
-human_sets_pause = False
+human_set_pause = False
+human_agent_action: Optional[ACTIONS] = None
 
 
-def key_press(key, mod):
-    global human_agent_action, human_wants_restart, human_sets_pause
-    if key == 0xFF0D:
-        human_wants_restart = True
-    if key == 32:
-        human_sets_pause = not human_sets_pause
-    a = int(key - ord("0"))
-    if a <= 0 or a >= ACTIONS:
-        return
-    human_agent_action = a
-
-
-def key_release(key, mod):
-    global human_agent_action
-    a = int(key - ord("0"))
-    if a <= 0 or a >= ACTIONS:
-        return
-    if human_agent_action == a:
-        human_agent_action = 0
-
-
-env.render()
-env.unwrapped.viewer.window.on_key_press = key_press
-env.unwrapped.viewer.window.on_key_release = key_release
 # Game Dynamics List of Ball and Paddle Positions
-x_balli = collections.deque([0] * 2, maxlen=2)
-y_balli = collections.deque([0] * 2, maxlen=2)
-x_platei = collections.deque([0] * 2, maxlen=2)
-y_platei = collections.deque([0] * 2, maxlen=2)
-rewardsi = collections.deque([0] * 100, maxlen=100)
-no_of_games = 0
+MAX_REWARDS = 100
+rewards = collections.deque([0] * MAX_REWARDS, maxlen=MAX_REWARDS)
+x_balli = collections.deque([0.0] * 2, maxlen=2)
+y_balli = collections.deque([0.0] * 2, maxlen=2)
+x_platei = collections.deque([0.0] * 2, maxlen=2)
+y_platei = collections.deque([0.0] * 2, maxlen=2)
+
+
+def add_shapes_for_contour(img, x: int, y: int, w: int, h: int):
+    # Draw a rectangle around the contour
+    cv2.rectangle(img, (x, y), (x + w, y + h), GREEN, thickness=1)
+    cent_x, cent_y = round(x + w / 2), round(y)
+    # Draw a circle around the contour
+    cv2.circle(img, (cent_x, cent_y), radius=1, color=BLUE, thickness=FILL)
+
+
+def update_position(contour, x_list, y_list) -> Tuple[int, int, int, int, int]:
+    x, y, w, h = cv2.boundingRect(contour)
+    # print(x, y, w, _h)
+    center = x + (w / 2)
+    x_platei.append(float(center))
+    y_platei.append(float(y))
+    return x, y, w, h, center
+
+
+def update_plate_position(contour) -> Tuple[int, int, int, int, int]:
+    return update_position(contour, x_platei, y_platei)
+
+
+def update_ball_position(contour) -> Tuple[int, int, int, int, int]:
+    return update_position(contour, x_balli, y_balli)
+
+
+def process_frame(img, itr: int, has_reward: bool) -> Tuple[bool, int, ACTIONS]:
+    """Determines the position of the ball and paddle then decides on an action to take.
+
+    :param img: A frame of gameplay
+
+    :return: Is the game over?
+    """
+    agent_action = ACTIONS.NOOP
+    # Image Processing - the full image
+
+    # Cropped Image: For Ball to detect crop Image Just under the Bricks
+    y_cols = slice(Y_CROP, Y_CROP + CROP_HEIGHT)
+    x_cols = slice(X_CROP, X_CROP + CROP_WIDTH)
+    img_ball = img[y_cols, x_cols]
+    # Image Processing PCT - Convert it to Grayscale
+    grayscale_ball = cv2.cvtColor(img_ball, cv2.COLOR_BGR2GRAY)
+    _ret, binary = cv2.threshold(grayscale_ball, CROP_HEIGHT, 255, cv2.THRESH_OTSU)
+    bin_ball = binary
+    ## Find Contours and Start Algo
+    contours, _hierarchy = cv2.findContours(
+        bin_ball,
+        cv2.RETR_TREE,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    num_contours = len(contours)
+    cnt_plate: Optional[Tuple[int, int, int, int]] = None
+    cnt_ball: Optional[Tuple[int, int, int, int]] = None
+    cnt_plate, cnt_ball = None, None
+    if num_contours == 0:
+        print("Nothing is Detected Something Wrong")
+        return True, itr, ACTIONS.NOOP
+    elif num_contours == 1:
+        cnt_plate = contours[0]
+    else:
+        cnt_plate, cnt_ball = contours
+        add_shapes_for_contour(img_ball, *cv2.boundingRect(cnt_ball))
+    add_shapes_for_contour(img_ball, *cv2.boundingRect(cnt_plate))
+
+    # To Reset the Game with One Contour Only
+    # There is no ball
+    if num_contours == 1:
+        ## Get the Plate's bounding rect
+        update_plate_position(cnt_plate)
+        return False, itr, ACTIONS.FIRE
+
+    x_ball, y_ball, *_ = update_ball_position(cnt_ball)
+    _, _, w_plate, _, cent_plate = update_plate_position(cnt_plate)
+
+    # Perceptual Ray Tracing
+    # Parameters
+    # A1, A2 = [x_ball, y_ball], [x_balli[0], y_balli[0]]
+    cv2.line(img_ball, [-300, Y_CROP], [300, Y_CROP], BLUE, 1)
+    cv2.line(img_ball, [CROP_WIDTH - 1, Y_CROP], [CROP_WIDTH - 1, 0], BLUE, 1)
+    cv2.line(img_ball, [0, Y_CROP], [0, -Y_CROP], BLUE, 1)
+    ball_base = x_ball
+    # Distance Between Ball and the Plate
+    dist_vib = w_plate / 2
+    cpoint_dist = dist_vib - 0.25
+
+    # Green Dot on the Line
+    cv2.circle(
+        img_ball,
+        (round(x_ball), Y_CROP),
+        radius=1,
+        color=GREEN,
+        thickness=-1,
+    )
+    imgS = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+    cv2.imshow("pctAgent", imgS)
+
+    if not has_reward:
+        return False, itr, ACTIONS.NOOP
+
+    # Negative is down, positive is up
+    ball_y_direction = (Y_CROP - y_ball) - (Y_CROP - y_balli[0])
+    if ball_y_direction < 0:  # If Ball going Down
+        # Hiearchical Loop
+        # First Perceptual Reference
+        R1 = 0
+        # All Gains
+        k1, k2, k3, k4 = -1, 1, 1, 1
+        # Distance Control
+        D = abs(ball_base - cent_plate) + 5
+        distance_error = R1 - D
+        R2 = distance_error * k1
+        # Movement Control
+        MD = np.sign(ball_base - cent_plate)
+        sign = 1
+        if MD < 0:
+            sign, agent_action = -1, ACTIONS.LEFT
+        else:
+            agent_action = ACTIONS.RIGHT
+        movement_error = R2 - MD
+        ref_position = movement_error * k2
+        # Position Control
+        position_error = ref_position + sign * cent_plate
+        ref_button_press = position_error * k3
+        button_press_error = ref_button_press - sign * ball_base
+        BP = button_press_error * k4
+
+        if MD != 0:
+            itr += 1
+        if (
+            itr > 1
+            or BP == ball_base
+            or (R2 < cpoint_dist)
+            or (MD > 0 and cent_plate > 136)
+        ):
+            agent_action = ACTIONS.NOOP
+            itr = 0
+
+    # Strategy to come in the Middle - Otherwise include a Velocity Control Reference
+    elif ball_y_direction > 0:  # If Ball Going up Come in the Center
+        disp = ball_base - cent_plate
+        agent_action = ACTIONS.LEFT if disp < 0 else ACTIONS.RIGHT
+        if disp != 0:
+            itr += 1
+        if itr > 1 or abs(CENTER_OFFSET - cent_plate) < dist_vib:
+            # if itr > 1 or abs(base - x_cent_plate) < dist_vib:
+            agent_action = ACTIONS.NOOP
+            itr = 0
+
+    return False, itr, agent_action
 
 
 def rollout(env):
-    global human_agent_action, human_wants_restart, human_sets_pause
+    global human_agent_action, human_wants_restart, human_set_pause
     human_wants_restart = False
     obser = env.reset()
     skip = 0
@@ -75,194 +221,88 @@ def rollout(env):
     total_timesteps = 0
     itr = 0
     # Game's Main Loop
+
+    action = ACTIONS.NOOP
     while 1:
-        if not skip:
-            # print("taking action {}".format(human_agent_action))
-            a = human_agent_action
+        if skip > 0:
+            skip -= 1
+        else:
+            if human_agent_action is not None:
+                action = human_agent_action
+                human_agent_action = None
+            if action != ACTIONS.NOOP:
+                # print(f"taking action {action}")
+                pass
             total_timesteps += 1
             skip = SKIP_CONTROL
-        else:
-            skip -= 1
-        obser, r, done, info = env.step(a)
-        # if r != 0:
-        total_reward += r
-        # Put latest 20 rewards in a list
-        rewardsi.append(total_reward)
-        # print("reward %d" % total_reward)
-        window_still_open = env.render()
-        img = env.render(mode="rgb_array")
-        # Image Processing
-        # For Ball to detect crop Image Just under the Bricks
-        yc_ball, xc_ball, hc_ball, wc_ball = 94, 9, 100, 141
-        # Crop Image
-        img_ball = img[yc_ball : yc_ball + hc_ball, xc_ball : xc_ball + wc_ball]
-        # Image Processing PCT - Convert it to Grayscale
-        grayscale_ball = cv2.cvtColor(img_ball, cv2.COLOR_BGR2GRAY)
-        ret, binary = cv2.threshold(grayscale_ball, 100, 255, cv2.THRESH_OTSU)
-        bin_ball = binary
-        ## Find Contours and Start Algo
-        contours_ball = cv2.findContours(
-            bin_ball, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-        )[0]
-        x0, y0, w0, h0 = cv2.boundingRect(contours_ball[0])
-        cv2.rectangle(img_ball, (x0, y0), (x0 + w0, y0 + h0), (0, 255, 0), 1)
-        a, b = round(x0 + w0 / 2), round(y0)
-        cv2.circle(img_ball, (a, b), radius=1, color=(0, 0, 255), thickness=-1)
 
-        if len(contours_ball) == 2:
-            x1, y1, w1, h1 = cv2.boundingRect(contours_ball[1])
-            a1, b1 = round(x1 + w1 / 2), round(y1 + h1)
-            cv2.circle(img_ball, (a1, b1), radius=1, color=(0, 0, 255), thickness=-1)
-            cv2.rectangle(img_ball, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0), 1)
-
-        # To Reset the Game with One Contour Only
-        if len(contours_ball) == 0:
-            print("Nothing is Detecte Something Wrong")
-            continue
-        elif len(contours_ball) == 1:
-            cnt_plate = contours_ball[0]
-            ## Get the Plate's bounding rect
-            bbox_plate = cv2.boundingRect(cnt_plate)
-            # print(bbox_plate)
-            x_plate, y_plate, w_plate, h_plate = bbox_plate
-            # Plate Coordinates
-            x_cent_plate = float(x_plate + (w_plate / 2))
-            y_plate = float(y_plate)
-            x_platei.append(x_cent_plate)
-            y_platei.append(y_plate)
-            human_agent_action = 1
-        elif len(contours_ball) == 2:
-            cnt_ball = contours_ball[1]
-            ## Get the Ball's bounding rect
-            bbox_ball = cv2.boundingRect(cnt_ball)
-            x_ball, y_ball, w_ball, h_ball = bbox_ball
-            # Ball Coordinates
-            x_ball = float(x_ball + (w_ball / 2))
-            y_ball = float(y_ball)
-            x_balli.append(x_ball)
-            y_balli.append(y_ball)
-            # print(y_ball)
-            cnt_plate = contours_ball[0]
-            ## Get the Plate's bounding rect
-            bbox_plate = cv2.boundingRect(cnt_plate)
-            # print(bbox_plate)
-            x_plate, y_plate, w_plate, h_plate = bbox_plate
-            # Plate Coordinates
-            x_cent_plate = float(x_plate + (w_plate / 2))
-            y_plate = float(y_plate)
-            x_platei.append(x_cent_plate)
-            y_platei.append(y_plate)
-            # Perceptual Ray Tracing
-            # Parameters
-            A1, A2 = [x_ball, y_ball], [x_balli[0], y_balli[0]]
-            B1, B2 = [-300, 94], [300, 94]
-            R1, R2 = [140, 94], [140, 0]
-            L1, L2 = [0, 94], [0, -94]
-            cv2.line(img_ball, B1, B2, (0, 0, 255), 1)
-            cv2.line(img_ball, R1, R2, (0, 0, 255), 1)
-            cv2.line(img_ball, L1, L2, (0, 0, 255), 1)
-            base = x_ball
-            # Distance Between Ball and the Plate
-            cpoint_dist = (w_plate / 2) - 0.25
-            # Center Point for Ball to Maintain
-            cpoint = 70
-            dist_vib = w_plate / 2
-            if total_reward > -1:
-                # If Ball going Down
-                if (94 - y_ball) - (94 - y_balli[0]) < 0:
-                    # Hiearchical Loop
-                    # First Perceptual Rference
-                    R1 = 0
-                    # All Gains
-                    k1 = -1
-                    k2 = 1
-                    k3 = 1
-                    k4 = 1
-                    # Distance Control
-                    D = abs(base - x_cent_plate) + 5
-                    e1 = R1 - D
-                    R2 = e1 * k1
-                    # Movement Control
-                    MD = np.sign(base - x_cent_plate)
-                    e2 = R2 - MD
-                    if MD < 0:
-                        human_agent_action = 3
-                        R3 = e2 * k2
-                        # Position Control
-                        e3 = R3 - x_cent_plate
-                        R4 = e3 * k3
-                        e4 = R4 + base
-                        BP = e4 * k4
-                        itr = itr + 1
-                        if itr > 1 or (R2 < cpoint_dist) or BP == base:
-                            human_agent_action = 0
-                            itr = 0
-                    if MD > 0:
-                        human_agent_action = 2
-                        R3 = e2 * k2
-                        # Position Control
-                        e3 = R3 + x_cent_plate
-                        R4 = e3 * k3
-                        e4 = R4 - base
-                        BP = e4 * k4
-                        itr = itr + 1
-                        if (
-                            itr > 1
-                            or (R2 < cpoint_dist)
-                            or BP == base
-                            or x_cent_plate > 136
-                        ):
-                            human_agent_action = 0
-                            itr = 0
-                # Strategy to come in the Middle - Otherwise include a Velocity Control Reference
-                # If Ball Going up Come in the Center
-                if ((94 - y_ball) - (94 - y_balli[0])) > 0:
-                    if (base - x_cent_plate) < 0:
-                        human_agent_action = 3
-                        itr = itr + 1
-                        if itr > 1 or abs(cpoint - x_cent_plate) < dist_vib:
-                            # if itr > 1 or abs(base - x_cent_plate) < dist_vib:
-                            human_agent_action = 0
-                            itr = 0
-                    if (base - x_cent_plate) > 0:
-                        human_agent_action = 2
-                        itr = itr + 1
-                        if itr > 1 or abs(cpoint - x_cent_plate) < dist_vib:
-                            # if itr > 1 or abs(base - x_cent_plate) < dist_vib:
-                            human_agent_action = 0
-                            itr = 0
-
-            # Green Dot on the Line
-            cv2.circle(
-                img_ball, (round(x_ball), 94), radius=1, color=(0, 255, 0), thickness=-1
-            )
-            imgS = cv2.resize(img, (400, 700))
-            cv2.imshow("pctAgent", imgS)
+        observation, reward, terminated, truncated, info = env.step(action.value)
+        total_reward += reward
+        # Put latest 100 rewards in a list
+        rewards.append(total_reward)
+        # print(f"reward {total_reward}")
+        window = env.render()
+        done, itr, action = process_frame(window, itr, total_reward > -1)
 
         # ------------OLD CODE-------------#
-        if window_still_open == False:
-            return False
-        if done:
+        if terminated or done or human_wants_restart:
             break
-        if human_wants_restart:
-            break
-        while human_sets_pause:
+        while human_set_pause:
             env.render()
             time.sleep(0.1)
 
         time.sleep(0.001)
-    print("timesteps %i reward %0.2f" % (total_timesteps, total_reward))
+    print(f"timesteps {total_timesteps} reward {total_reward}")
 
 
-print("ACTIONS={}".format(ACTIONS))
-print("Press keys 1 2 3 ... to take actions 1 2 3 ...")
-print("No keys pressed is taking action 0")
+def key_press(key, mod):
+    global human_agent_action, human_wants_restart, human_set_pause
+    if key in RESTART_KEYS:
+        human_wants_restart = True
+    if key in PAUSE_KEYS:  # Toggle pause
+        human_set_pause = not human_set_pause
+    action = int(key - ASCII_0)
+    if action not in ACTIONS:
+        return
+    human_agent_action = action
 
-while 1:
-    no_of_games = no_of_games + 1
-    window_still_open = rollout(env)
-    print(no_of_games)
-    if window_still_open == False:
-        # outF.close()
-        cv2.destroyAllWindows()
-        break
+
+def key_release(key, mod):
+    global human_agent_action
+    action = int(key - ASCII_0)
+    if action not in ACTIONS:
+        return
+    if human_agent_action == action:
+        human_agent_action = ACTIONS.NOOP
+
+
+def main():
+
+    if not hasattr(env.action_space, "n"):
+        raise Exception("Keyboard agent only supports discrete action spaces")
+
+    env.reset()
+    env.render()
+    # Set key handlers
+    # env.unwrapped.viewer.window.on_key_press = key_press  # type: ignore
+    # env.unwrapped.viewer.window.on_key_release = key_release  # type: ignore
+
+    print(f"ACTIONS={ACTIONS}")
+    print(
+        f"Press keys {[a.value for a in ACTIONS]} ... to take actions {list(ACTIONS)} ..."
+    )
+    print("No keys pressed is taking action 0")
+
+    no_of_games = 0
+    while 1:
+        no_of_games += 1
+        window_still_open = rollout(env)
+        print(no_of_games)
+        if window_still_open is False:
+            # outF.close()
+            cv2.destroyAllWindows()
+            break
+
+
+if __name__ == "__main__":
+    main()
